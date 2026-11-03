@@ -1,4 +1,4 @@
-"""Web UI for browsing WeCom chat data.
+"""Deprecated Web UI for browsing WeCom chat data. Only the CLI is maintained.
 
 Usage: python -m wecom_reader.web --db-dir E:/WXWork/1688851235369380/Data
 """
@@ -284,12 +284,14 @@ def api_refresh():
 
 def main():
     import argparse
-    parser = argparse.ArgumentParser(description="WeCom chat web viewer")
+    parser = argparse.ArgumentParser(description="Deprecated WeCom web viewer; only the CLI is maintained")
     parser.add_argument("--db-dir", required=True, help="WeCom data directory")
     parser.add_argument("--decrypted-dir", default="wxwork_decrypted", help="Decrypted DB directory")
     parser.add_argument("--port", type=int, default=8765, help="Web server port")
     parser.add_argument("--host", default="127.0.0.1", help="Bind address")
     args = parser.parse_args()
+
+    print("Warning: Web UI is deprecated and no longer maintained; use the CLI.", file=sys.stderr)
 
     global reader
     reader = WeComReader(db_dir=args.db_dir, decrypted_dir=args.decrypted_dir)

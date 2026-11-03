@@ -1,6 +1,6 @@
 # wecom-reader
 
-企业微信（WeCom）本地聊天记录读取工具。从 WXWork.exe 进程内存提取密钥，解密本地 SQLite 数据库，提供 CLI / Python 库 / Web UI 三种访问方式。
+企业微信（WeCom）本地聊天记录读取工具。从 WXWork.exe 进程内存提取密钥，解密本地 SQLite 数据库，提供 CLI / Python 库 / Web UI（deprecated） 三种访问方式。
 
 ## 原理
 
@@ -9,36 +9,49 @@
 - 密钥长度：16 字节（128 bit）
 - 密钥数量：**一个全局密钥**解密所有数据库（比个人微信简单得多）
 - 加密方式：每页独立派生 key/IV，无 HMAC，无 PBKDF2
-- 密钥提取：通过 Windows API 读取 WXWork.exe 进程内存
+- 密钥提取：Windows 通过 Windows API，Linux/Wine 通过 `/proc/<pid>/mem` 只读扫描 WXWork.exe 进程内存
 
-## 安装
+## 安装与使用
+
+安装 [uv](https://docs.astral.sh/uv/getting-started/installation/) 和 Git 后，可以直接从 GitHub 运行，无需预先克隆仓库、手动创建 venv 或安装依赖。
 
 ```bash
-pip install pycryptodomex click flask
+# GitHub
+uvx --from "git+https://github.com/yankuangxindaL4/wecom-reader.git@main" wecom-reader --help
+
 ```
 
-## 使用
+`@main` 指定默认分支，也可替换为 tag 或完整 commit SHA 来固定版本。
 
-### CLI
+下列示例在本地源码根目录使用 `--from .`；从远程运行时，将 `.` 替换为上面的 GitHub `git+...` 地址即可。`--db-dir` 和 `--decrypted-dir` 是全局参数，放在子命令前。快照默认保存在当前工作目录的 `wxwork_decrypted`；跨目录使用时请显式指定同一个绝对路径，例如 `--decrypted-dir "/path/to/snapshot"`。
 
 ```bash
-# 提取密钥 + 解密所有数据库（需要管理员权限，WXWork.exe 运行中）
-python -m wecom_reader.cli init --db-dir "E:\WXWork\<account_id>\Data"
+# 查看命令帮助
+uvx --from . wecom-reader --help
+
+# 初始化：Windows（WXWork.exe 运行中，需要内存读取权限）
+uvx --from . wecom-reader --db-dir "E:\WXWork\<account_id>\Data" init
+
+# 初始化：Linux/Wine（使用本机 Python，无需 Windows Python）
+uvx --from . wecom-reader --db-dir "/path/to/WXWork/account/Data" init
 
 # 查看状态
-python -m wecom_reader.cli status
+uvx --from . wecom-reader status
 
 # 列出会话
-python -m wecom_reader.cli sessions --limit 20
+uvx --from . wecom-reader sessions --limit 20
 
 # 查看消息
-python -m wecom_reader.cli messages R:12345 --limit 50
+uvx --from . wecom-reader messages R:12345 --limit 50
 
 # 搜索消息
-python -m wecom_reader.cli search "关键词"
+uvx --from . wecom-reader search "关键词"
 
 # 查看联系人
-python -m wecom_reader.cli contacts --keyword "张三"
+uvx --from . wecom-reader contacts --keyword "张三"
+
+# 导出消息（最多最近 10,000 条，超出时提示截断）
+uvx --from . wecom-reader export R:12345 --output messages.json
 ```
 
 ### Python 库
@@ -55,7 +68,9 @@ results = reader.search_messages("关键词")
 contacts = reader.contacts(keyword="张三")
 ```
 
-### Web UI
+### Web UI（deprecated）
+
+Web 服务已弃用，保留旧入口但不再维护或修复；请使用 CLI。
 
 ```bash
 python -m wecom_reader.web --db-dir "E:\WXWork\<account_id>\Data"
