@@ -135,7 +135,15 @@ def group_members(ctx, session_id):
 def export(ctx, session_id, fmt, output):
     """Export a conversation to JSON or CSV."""
     reader: WeComReader = ctx.obj["reader"]
-    messages = reader.get_messages(session_id, limit=10000)
+    export_limit = 10000
+    messages = reader.get_messages(session_id, limit=export_limit + 1)
+    if len(messages) > export_limit:
+        messages = messages[:export_limit]
+        click.echo(
+            f"Warning: export truncated to the most recent {export_limit:,} messages; "
+            "older messages were omitted.",
+            err=True,
+        )
 
     if fmt == "json":
         data = json.dumps(messages, ensure_ascii=False, indent=2)
