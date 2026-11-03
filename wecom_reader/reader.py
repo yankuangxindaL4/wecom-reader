@@ -1,13 +1,14 @@
 """Main WeComReader class — unified interface for WeCom chat data access."""
 
+from contextlib import closing
 import os
 import shutil
 import sys
-import sqlite3
 from typing import Optional
 
 from .crypto.decrypt import decrypt_database, is_plain_sqlite, is_wxsqlite3_aes128_page1, verify_key
 from .crypto.key_extract import extract_key
+from .db import connect_readonly
 from .db.contact import build_user_map, get_group_members, list_contacts
 from .db.message import get_message_count, get_messages, search_messages
 from .db.session import get_session_count, list_sessions
@@ -71,14 +72,13 @@ class WeComReader:
                 if name.endswith(".db") and os.path.isfile(path):
                     sz = os.path.getsize(path)
                     try:
-                        conn = sqlite3.connect(path)
-                        tables = [
-                            r[0]
-                            for r in conn.execute(
-                                "SELECT name FROM sqlite_master WHERE type='table'"
-                            ).fetchall()
-                        ]
-                        conn.close()
+                        with closing(connect_readonly(path)) as conn:
+                            tables = [
+                                r[0]
+                                for r in conn.execute(
+                                    "SELECT name FROM sqlite_master WHERE type='table'"
+                                ).fetchall()
+                            ]
                     except Exception:
                         tables = []
                     result["databases"][name] = {

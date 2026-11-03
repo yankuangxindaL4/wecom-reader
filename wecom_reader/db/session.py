@@ -3,6 +3,8 @@
 import sqlite3
 from typing import Optional
 
+from . import connect_readonly
+
 
 def _table_exists(conn: sqlite3.Connection, table: str) -> bool:
     row = conn.execute(
@@ -30,7 +32,7 @@ def list_sessions(
     Returns:
         List of session dicts with id, name, type, last_message_time, etc.
     """
-    conn = sqlite3.connect(db_path)
+    conn = connect_readonly(db_path)
     conn.row_factory = sqlite3.Row
     try:
         if not _table_exists(conn, "conversation_table"):
@@ -95,7 +97,7 @@ def _classify_session(cid: str) -> str:
 
 def get_session_count(db_path: str) -> int:
     """Get total number of sessions."""
-    conn = sqlite3.connect(db_path)
+    conn = connect_readonly(db_path)
     try:
         if not _table_exists(conn, "conversation_table"):
             return 0

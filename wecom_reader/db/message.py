@@ -12,6 +12,8 @@ import re
 import sqlite3
 from typing import Optional
 
+from . import connect_readonly
+
 MESSAGE_TABLES = ("message_table", "message_small_table", "kf_message_tableV1")
 
 MSG_TYPES = {
@@ -100,7 +102,7 @@ def get_messages(
     Uses actual column names from decrypted WeCom schema:
       sender_id, conversation_id, content_type, send_time, content, message_id, server_id
     """
-    conn = sqlite3.connect(db_path)
+    conn = connect_readonly(db_path)
     conn.row_factory = sqlite3.Row
     try:
         messages = []
@@ -160,7 +162,7 @@ def search_messages(
     limit: int = 50,
 ) -> list[dict]:
     """Search messages by keyword in content field."""
-    conn = sqlite3.connect(db_path)
+    conn = connect_readonly(db_path)
     conn.row_factory = sqlite3.Row
     try:
         messages = []
@@ -205,7 +207,7 @@ def search_messages(
 
 def get_message_count(db_path: str, conversation_id: str) -> int:
     """Get total message count for a conversation."""
-    conn = sqlite3.connect(db_path)
+    conn = connect_readonly(db_path)
     try:
         total = 0
         for table in MESSAGE_TABLES:

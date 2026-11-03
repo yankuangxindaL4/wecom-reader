@@ -3,6 +3,8 @@
 import sqlite3
 from typing import Optional
 
+from . import connect_readonly
+
 
 def _table_exists(conn: sqlite3.Connection, table: str) -> bool:
     row = conn.execute(
@@ -28,7 +30,7 @@ def list_contacts(
     Returns:
         List of contact dicts.
     """
-    conn = sqlite3.connect(db_path)
+    conn = connect_readonly(db_path)
     conn.row_factory = sqlite3.Row
     try:
         contacts = []
@@ -96,7 +98,7 @@ def list_contacts(
 
 def build_user_map(db_path: str) -> dict[int, str]:
     """Build user_id -> display_name mapping for message sender resolution."""
-    conn = sqlite3.connect(db_path)
+    conn = connect_readonly(db_path)
     conn.row_factory = sqlite3.Row
     try:
         users = {}
@@ -128,7 +130,7 @@ def build_user_map(db_path: str) -> dict[int, str]:
 
 def get_group_members(session_db_path: str, conversation_id: str) -> dict[int, str]:
     """Get group members with nicknames for a conversation."""
-    conn = sqlite3.connect(session_db_path)
+    conn = connect_readonly(session_db_path)
     conn.row_factory = sqlite3.Row
     try:
         members = {}
