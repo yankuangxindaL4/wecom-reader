@@ -271,11 +271,18 @@ class WeComReader:
         return list_contacts(user_db, keyword=keyword, limit=limit, offset=offset)
 
     def group_members(self, conversation_id: str) -> dict[int, str]:
-        """Get group members with nicknames."""
+        """Get all members, preferring nicknames, then contact names, then IDs."""
         session_db = self._get_db_path("session.db")
         if not session_db:
             return {}
-        return get_group_members(session_db, conversation_id)
+        members = get_group_members(session_db, conversation_id)
+        if any(not nickname for nickname in members.values()):
+            self._ensure_user_map()
+            return {
+                uid: nickname or self._user_map.get(uid) or str(uid)
+                for uid, nickname in members.items()
+            }
+        return members
 
     def session_count(self) -> int:
         """Get total session count."""

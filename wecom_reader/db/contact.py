@@ -44,8 +44,7 @@ def list_contacts(
                 kw = f"%{keyword}%"
                 params.extend([kw, kw, kw, kw])
 
-            query += " ORDER BY id LIMIT ? OFFSET ?"
-            params.extend([limit, offset])
+            query += " ORDER BY id"
 
             for row in conn.execute(query, params):
                 display_name = row["real_name"] or row["name"] or row["account"] or ""
@@ -72,8 +71,7 @@ def list_contacts(
                 query += " WHERE (remarks LIKE ? OR real_remarks LIKE ? OR corp_remark LIKE ?)"
                 kw = f"%{keyword}%"
                 params.extend([kw, kw, kw])
-            query += " LIMIT ? OFFSET ?"
-            params.extend([limit, offset])
+            query += " ORDER BY user_id"
 
             for row in conn.execute(query, params):
                 uid = row["user_id"]
@@ -81,6 +79,7 @@ def list_contacts(
                     continue
                 name = row["real_remarks"] or row["remarks"] or row["corp_remark"] or ""
                 if name:
+                    existing_ids.add(uid)
                     contacts.append({
                         "id": uid,
                         "name": name,
@@ -91,7 +90,11 @@ def list_contacts(
                         "job": None,
                     })
 
-        return contacts
+        # Page the combined, deduplicated result in a stable order.
+        contacts.sort(key=lambda contact: contact["id"])
+        start = max(offset, 0)
+        stop = None if limit < 0 else start + limit
+        return contacts[start:stop]
     finally:
         conn.close()
 
@@ -129,7 +132,7 @@ def build_user_map(db_path: str) -> dict[int, str]:
 
 
 def get_group_members(session_db_path: str, conversation_id: str) -> dict[int, str]:
-    """Get group members with nicknames for a conversation."""
+    """Get all group member IDs, using an empty string for missing nicknames."""
     conn = connect_readonly(session_db_path)
     conn.row_factory = sqlite3.Row
     try:
@@ -139,8 +142,7 @@ def get_group_members(session_db_path: str, conversation_id: str) -> dict[int, s
                 "SELECT user_id, nick_name FROM conversation_user_table WHERE conversation_id = ?",
                 (conversation_id,),
             ):
-                if row["nick_name"]:
-                    members[int(row["user_id"])] = row["nick_name"]
+                members[int(row["user_id"])] = row["nick_name"] or ""
         return members
     finally:
         conn.close()
