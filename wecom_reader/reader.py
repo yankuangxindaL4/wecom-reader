@@ -2,6 +2,7 @@
 
 import os
 import shutil
+import sys
 import sqlite3
 from typing import Optional
 
@@ -104,7 +105,7 @@ class WeComReader:
         # Extract keys
         if self._key_map is None:
             if verbose:
-                print("[*] Extracting keys from WXWork.exe memory...")
+                print("[*] Extracting keys from WXWork.exe memory...", file=sys.stderr)
             self._key_map = extract_key(
                 db_dir=self._db_dir, timeout=timeout, verbose=verbose
             )
@@ -112,6 +113,15 @@ class WeComReader:
         self._db_dir = self._key_map.get("_db_dir", self._db_dir)
         if not self._db_dir:
             raise RuntimeError("No db_dir found in key map")
+
+        source_dir = os.path.realpath(self._db_dir)
+        output_dir = os.path.realpath(self._decrypted_dir)
+        try:
+            output_in_source = os.path.commonpath([source_dir, output_dir]) == source_dir
+        except ValueError:
+            output_in_source = False  # Different Windows drives.
+        if output_in_source:
+            raise ValueError("Decrypted output directory must be outside the source Data directory")
 
         # Decrypt databases
         os.makedirs(self._decrypted_dir, exist_ok=True)

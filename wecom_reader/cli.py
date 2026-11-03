@@ -34,13 +34,13 @@ def main(ctx, db_dir, decrypted_dir):
 
 
 @main.command()
-@click.option("--timeout", default=120, help="Memory scan timeout (seconds)")
+@click.option("--timeout", type=click.IntRange(min=1), default=120, help="Memory scan timeout per process (seconds)")
 @click.option("--verbose", "-v", is_flag=True, help="Print progress")
 @click.pass_context
 def init(ctx, timeout, verbose):
     """Extract keys and decrypt all WeCom databases.
 
-    Requires: WXWork.exe running, admin privileges.
+    Requires: WXWork.exe running on Windows or Linux/Wine, memory read permission.
     """
     reader: WeComReader = ctx.obj["reader"]
     try:
