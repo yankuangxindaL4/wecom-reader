@@ -8,29 +8,46 @@ import struct
 from Cryptodome.Cipher import AES
 
 
+def encrypt_page(page, key, number):
+    """Independent wxSQLite3 encoder, also used for actual SQLite WAL pages."""
+    state = number + 1
+    seed = bytearray()
+    for _ in range(4):
+        quotient = state // 52774
+        state = 40692 * (state - 52774 * quotient) - 3791 * quotient
+        if state < 0:
+            state += 2147483399
+        seed.extend(struct.pack('<I', state))
+    iv = hashlib.md5(seed).digest()
+    page_key = hashlib.md5(key + struct.pack('<I', number) + b'sAlT').digest()
+    cipher = AES.new(page_key, AES.MODE_CBC, iv)
+    if number == 1:
+        tail = cipher.encrypt(page[16:])
+        return b'fixture!' + tail[:8] + page[16:24] + tail[8:]
+    return cipher.encrypt(page)
+
+
 def encrypt_database(plain, key):
     """Encode the documented wxSQLite3 AES-128 format, independently of the reader."""
-    result = bytearray()
     assert len(plain) % 4096 == 0
-    for offset in range(0, len(plain), 4096):
-        number = offset // 4096 + 1
-        state = number + 1
-        seed = bytearray()
-        for _ in range(4):
-            quotient = state // 52774
-            state = 40692 * (state - 52774 * quotient) - 3791 * quotient
-            if state < 0:
-                state += 2147483399
-            seed.extend(struct.pack('<I', state))
-        iv = hashlib.md5(seed).digest()
-        page_key = hashlib.md5(key + struct.pack('<I', number) + b'sAlT').digest()
-        cipher = AES.new(page_key, AES.MODE_CBC, iv)
-        page = plain[offset:offset + 4096]
-        if number == 1:
-            tail = cipher.encrypt(page[16:])
-            result.extend(b'fixture!' + tail[:8] + page[16:24] + tail[8:])
-        else:
-            result.extend(cipher.encrypt(page))
+    return b''.join(encrypt_page(plain[offset:offset + 4096], key, offset // 4096 + 1)
+                    for offset in range(0, len(plain), 4096))
+
+
+def encrypt_wal(plain, key):
+    """Encrypt pages in a WAL produced by SQLite and recalculate its checksums."""
+    header = plain[:32]
+    endian = '<' if struct.unpack('>I', header[:4])[0] == 0x377f0682 else '>'
+    c0, c1 = struct.unpack('>II', header[24:])
+    result = bytearray(header)
+    for offset in range(32, len(plain), 24 + 4096):
+        frame = plain[offset:offset + 24]
+        page = encrypt_page(plain[offset + 24:offset + 24 + 4096], key, struct.unpack('>I', frame[:4])[0])
+        words = struct.unpack(endian + 'I' * ((8 + 4096) // 4), frame[:8] + page)
+        for index in range(0, len(words), 2):
+            c0 = (c0 + words[index] + c1) & 0xffffffff
+            c1 = (c1 + words[index + 1] + c0) & 0xffffffff
+        result.extend(frame[:16] + struct.pack('>II', c0, c1) + page)
     return bytes(result)
 
 

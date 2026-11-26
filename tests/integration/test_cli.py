@@ -129,13 +129,17 @@ class IntegrationTests(unittest.TestCase):
 
     def cli(self, *arguments, output=None, env=None, code=0, parse=True, source=False):
         environment = os.environ.copy()
-        for name in ('PYTHONPATH', 'WXWORK_DB_DIR'):
+        for name in ('PYTHONPATH', 'WXWORK_DB_DIR', 'WXWORK_DECRYPTED_DIR', 'WXWORK_KEY_DIR'):
             environment.pop(name, None)
+        environment['WXWORK_KEY_DIR'] = str(self.root / 'keys')
+        environment['XDG_DATA_HOME'] = str(self.root / 'data-home')
+        environment['LOCALAPPDATA'] = str(self.root / 'app-data')
+        environment['USERPROFILE'] = str(self.root / 'profile')
         environment['UV_TOOL_DIR'] = str(Path(self.build.name) / 'uv-tools')
         environment['PYTHONIOENCODING'] = 'utf-8'
         environment['PYTHONUTF8'] = '1'
         environment.update(env or {})
-        paths = ['--decrypted-dir', str(output if output is not None else self.snapshot)]
+        paths = [] if output is False else ['--decrypted-dir', str(output if output is not None else self.snapshot)]
         if source:
             paths += ['--db-dir', str(self.source)]
         result = subprocess.run([*self.command, *paths, *map(str, arguments)], cwd=self.cwd,
@@ -151,13 +155,156 @@ class IntegrationTests(unittest.TestCase):
                                       source=not env_path,
                                       env={'WXWORK_DB_DIR': str(self.source)} if env_path else None)
             self.assertTrue(report['success'])
-            self.assertEqual((report['decrypted'], report['copied'], report['failed']), (3, 1, 0))
+            self.assertEqual(report['key_count'], 1)
+            self.assertFalse(self.snapshot.exists())
             self.assertIn(f'PID {process.pid}', result.stderr)
+        report, _ = self.cli('refresh', source=True)
+        self.assertEqual((report['decrypted'], report['copied'], report['failed']), (3, 1, 0))
         self.assertEqual(fingerprints(self.source), self.original)
         for name, expected in self.expected.items():
             self.assertEqual((self.snapshot / name).read_bytes(), expected, name)
             with closing(sqlite3.connect(self.snapshot / name)) as conn:
                 self.assertEqual(conn.execute('PRAGMA integrity_check').fetchone()[0], 'ok')
+
+    def test_query_decrypts_with_cached_key_after_process_exits(self):
+        with self.fake():
+            report, _ = self.cli('init', source=True)
+        self.assertFalse(self.snapshot.exists())
+        keys = list((self.root / 'keys').glob('*.json'))
+        self.assertEqual(len(keys), 1)
+        if sys.platform != 'win32':
+            self.assertEqual(keys[0].stat().st_mode & 0o777, 0o600)
+            self.assertEqual(keys[0].parent.stat().st_mode & 0o777, 0o700)
+        result, _ = self.cli('search', 'hello')
+        self.assertEqual(result['count'], 7)
+        self.assertEqual(fingerprints(self.source), self.original)
+
+    def test_missing_key_query_and_refresh_never_scan_memory(self):
+        with self.fake():
+            for command in [('search', 'hello'), ('refresh',)]:
+                report, _ = self.cli(*command, source=True, code=1)
+                self.assertIn('run init', report['error'])
+        self.assertFalse(list(self.snapshot.glob('*.db')))
+
+    def test_freshness_manual_refresh_and_init_invalidation(self):
+        self.initialize()
+        from fixtures import encrypt_database
+        original = self.snapshot / 'session.db'
+        staged = self.root / 'updated.db'
+        shutil.copy2(original, staged)
+        with closing(sqlite3.connect(staged)) as conn, conn:
+            conn.execute("UPDATE conversation_table SET name='Updated room' WHERE id='R:1'")
+        (self.source / 'session.db').write_bytes(encrypt_database(staged.read_bytes(), self.key))
+        report, _ = self.cli('sessions', '--keyword', 'Updated')
+        self.assertEqual(report['count'], 0)
+        report, _ = self.cli('refresh')
+        self.assertEqual(report['updated'], 1)
+        report, _ = self.cli('sessions', '--keyword', 'Updated')
+        self.assertEqual(report['count'], 1)
+        report, _ = self.cli('refresh')
+        self.assertEqual(report['updated'], 0)
+        # A new init invalidates the snapshot even if source fingerprints match.
+        with self.fake():
+            self.cli('init', source=True)
+        before = (self.snapshot / '.wecom-snapshot.json').read_bytes()
+        self.cli('sessions')
+        self.assertNotEqual((self.snapshot / '.wecom-snapshot.json').read_bytes(), before)
+
+    def test_expired_snapshot_refreshes_and_failure_preserves_old_files(self):
+        self.initialize()
+        manifest = self.snapshot / '.wecom-snapshot.json'
+        record = json.loads(manifest.read_text())
+        record['checked_at'] = 0
+        manifest.write_text(json.dumps(record))
+        self.cli('sessions')
+        self.assertGreater(json.loads(manifest.read_text())['checked_at'], 0)
+        before = fingerprints(self.snapshot)
+        from fixtures import encrypt_database
+        (self.source / 'session.db').write_bytes(encrypt_database(self.expected['session.db'], os.urandom(16)))
+        report, _ = self.cli('refresh', code=1)
+        self.assertIn('run init', report['error'])
+        self.assertEqual(fingerprints(self.snapshot), before)
+        cache = fingerprints(self.root / 'keys')
+        with self.fake(key=os.urandom(16)):
+            self.cli('init', source=True, code=1)
+        self.assertEqual(fingerprints(self.root / 'keys'), cache)
+
+    def test_default_paths_account_selection_and_snapshot_ownership(self):
+        with self.fake():
+            first, _ = self.cli('init', source=True, output=False)
+        self.cli('sessions', output=False)
+        first_snapshot = Path(first['decrypted_dir'])
+        self.assertTrue(first_snapshot.is_dir())
+        self.cwd = self.root  # Selection and paths do not depend on cwd.
+        status, _ = self.cli('status', output=False)
+        self.assertEqual(status['decrypted_dir'], str(first_snapshot))
+        other_root = self.root / 'other'
+        other_root.mkdir()
+        other_source, _ = create_source(other_root, self.key)
+        os.utime(other_source / 'session.db', ns=(2000000000000000000, 2000000000000000000))
+        with self.fake():
+            second, _ = self.cli('init', output=False, env={'WXWORK_DB_DIR': str(other_source)})
+        status, _ = self.cli('status', output=False)
+        self.assertEqual(status['account'], second['account'])
+        self.assertNotEqual(first['decrypted_dir'], second['decrypted_dir'])
+        status, _ = self.cli('--account', first['account'], 'status', output=False)
+        self.assertEqual(status['account'], first['account'])
+        report, _ = self.cli('refresh', output=first_snapshot,
+                             env={'WXWORK_DB_DIR': str(other_source)}, code=1)
+        self.assertIn('another account', report['error'])
+        # Environment output is shared by queries, but an explicit CLI path wins.
+        status, _ = self.cli('status', output=False,
+                             env={'WXWORK_DECRYPTED_DIR': str(first_snapshot)})
+        self.assertEqual(status['account'], first['account'])
+        status, _ = self.cli('status', output=first_snapshot,
+                             env={'WXWORK_DECRYPTED_DIR': str(self.root / 'unused')})
+        self.assertEqual(status['decrypted_dir'], str(first_snapshot))
+
+    def test_wal_only_update_refreshes_committed_plain_database(self):
+        self.initialize()
+        path = self.source / 'plain.db'
+        with closing(sqlite3.connect(path)) as conn:
+            conn.execute('PRAGMA wal_autocheckpoint=0')
+            before = path.read_bytes()
+            conn.execute("INSERT INTO records VALUES ('new WAL record')")
+            conn.commit()
+            self.assertEqual(path.read_bytes(), before)
+            report, _ = self.cli('refresh')
+            self.assertEqual(report['updated'], 1)
+            with closing(sqlite3.connect(self.snapshot / 'plain.db')) as snapshot:
+                self.assertEqual(snapshot.execute('SELECT count(*) FROM records').fetchone()[0], 2)
+
+    def test_encrypted_wal_update_replays_commit_and_ignores_incomplete_tail(self):
+        self.initialize()
+        from fixtures import encrypt_wal
+        plain = self.root / 'fixture originals/session.db'
+        with closing(sqlite3.connect(plain)) as conn:
+            conn.execute('PRAGMA wal_autocheckpoint=0')
+            conn.execute("UPDATE conversation_table SET name='WAL room' WHERE id='R:1'")
+            conn.commit()
+            wal = encrypt_wal(Path(str(plain) + '-wal').read_bytes(), self.key)
+            target = self.source / 'session.db-wal'
+            target.write_bytes(wal + b'incomplete frame')
+            source_before = fingerprints(self.source)
+            report, _ = self.cli('refresh')
+            self.assertEqual(report['updated'], 1)
+            report, _ = self.cli('sessions', '--keyword', 'WAL room')
+            self.assertEqual(report['count'], 1)
+            self.assertEqual(fingerprints(self.source), source_before)
+            before = fingerprints(self.snapshot)
+            damaged = bytearray(wal)
+            damaged[32 + 24 + 100] ^= 1
+            target.write_bytes(damaged)
+            self.cli('refresh', code=1)
+            self.assertEqual(fingerprints(self.snapshot), before)
+
+    def test_offline_snapshot_and_explicit_refresh_failure(self):
+        self.initialize()
+        shutil.rmtree(self.source)
+        report, _ = self.cli('search', 'hello')
+        self.assertEqual(report['count'], 7)
+        report, _ = self.cli('refresh', code=1)
+        self.assertIn('unavailable', report['error'])
 
     def test_init_discovers_real_process_and_decrypts_all_databases(self):
         self.initialize()

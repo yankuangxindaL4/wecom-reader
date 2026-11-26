@@ -5,6 +5,8 @@ All commands output JSON by default. Use --table for human-readable tables.
 
 import json
 import sys
+import sqlite3
+from pathlib import Path
 
 import click
 
@@ -19,18 +21,33 @@ def _json_output(data, pretty=True):
     click.echo(json.dumps(data, **kwargs))
 
 
-@click.group()
+class JsonGroup(click.Group):
+    def invoke(self, ctx):
+        try:
+            return super().invoke(ctx)
+        except (RuntimeError, ValueError, OSError, sqlite3.Error) as error:
+            _json_output({"success": False, "error": str(error)})
+            ctx.exit(1)
+
+
+@click.group(cls=JsonGroup)
 @click.option("--db-dir", envvar="WXWORK_DB_DIR", help="WeCom data directory")
-@click.option("--decrypted-dir", default="wxwork_decrypted", help="Decrypted DB output directory")
+@click.option("--decrypted-dir", envvar="WXWORK_DECRYPTED_DIR", help="Snapshot directory (default: user data directory, per account)")
+@click.option("--key-dir", envvar="WXWORK_KEY_DIR", help="Key cache directory (default: user cache directory)")
+@click.option("--account", help="Account ID from status (default: most recently active)")
 @click.pass_context
-def main(ctx, db_dir, decrypted_dir):
+def main(ctx, db_dir, decrypted_dir, key_dir, account):
     """wecom-reader — Read WeCom (企业微信) local chat history.
 
     Agent-reusable tool for querying WeCom chat data.
     All commands output JSON by default.
     """
     ctx.ensure_object(dict)
-    ctx.obj["reader"] = WeComReader(db_dir=db_dir, decrypted_dir=decrypted_dir)
+    reader = WeComReader(db_dir=db_dir, decrypted_dir=decrypted_dir)
+    if key_dir:
+        reader._key_dir = Path(key_dir).expanduser().resolve()
+    reader._account_selector = account
+    ctx.obj["reader"] = reader
 
 
 @main.command()
@@ -38,7 +55,7 @@ def main(ctx, db_dir, decrypted_dir):
 @click.option("--verbose", "-v", is_flag=True, help="Print progress")
 @click.pass_context
 def init(ctx, timeout, verbose):
-    """Extract keys and decrypt all WeCom databases.
+    """Extract, verify and cache keys without decrypting databases.
 
     Requires: WXWork.exe running on Windows or Linux/Wine, memory read permission.
     """
@@ -49,6 +66,13 @@ def init(ctx, timeout, verbose):
     except Exception as e:
         _json_output({"success": False, "error": str(e)})
         sys.exit(1)
+
+
+@main.command()
+@click.pass_context
+def refresh(ctx):
+    """Immediately update snapshots using cached keys; never scan process memory."""
+    _json_output(ctx.obj["reader"].refresh())
 
 
 @main.command()

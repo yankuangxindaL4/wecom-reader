@@ -1,35 +1,31 @@
 """Main WeComReader class — unified interface for WeCom chat data access."""
 
 from contextlib import closing
+import logging
 import os
-import shutil
-import sys
+from pathlib import Path
+import sqlite3
+import tempfile
+import time
 from typing import Optional
+import uuid
 
-from .crypto.decrypt import decrypt_database, is_plain_sqlite, is_wxsqlite3_aes128_page1, verify_key
-from .crypto.key_extract import extract_key
+from .crypto.key_extract import extract_key, _collect_db_files
+from .crypto.decrypt import verify_key
 from .db import connect_readonly
 from .db.contact import build_user_map, get_group_members, list_contacts
 from .db.message import get_message_count, get_messages, search_messages
 from .db.session import get_session_count, list_sessions
+from .snapshot import build_database, fingerprints, publish_files, snapshot_lock
+from .storage import (account_id, accounts, default_root, key_directory,
+                      private_directory, read_json, select_source, write_json)
 
 
 class WeComReader:
-    """Agent-reusable WeCom (企业微信) local chat reader.
+    """Initialize keys once with init(); queries refresh snapshots as needed."""
 
-    Usage:
-        reader = WeComReader()           # auto-detect
-        reader = WeComReader(db_dir=...) # explicit path
-
-        # One-step init + decrypt
-        reader.init()
-
-        # Query
-        sessions = reader.list_sessions()
-        msgs = reader.get_messages("R:12345")
-        results = reader.search_messages("keyword")
-        contacts = reader.contacts()
-    """
+    FRESHNESS_SECONDS = 300
+    MANIFEST = '.wecom-snapshot.json'
 
     def __init__(
         self,
@@ -37,154 +33,212 @@ class WeComReader:
         decrypted_dir: Optional[str] = None,
         key_map: Optional[dict] = None,
     ):
-        """Initialize reader.
-
-        Args:
-            db_dir: Path to WeCom Data directory (auto-detected if None).
-            decrypted_dir: Path for decrypted DB output (default: ./wxwork_decrypted).
-            key_map: Pre-extracted key map from extract_key(). If None, init() will extract.
-        """
-        self._db_dir = db_dir
-        self._decrypted_dir = decrypted_dir or os.path.join(os.getcwd(), "wxwork_decrypted")
+        self._db_dir = db_dir or os.environ.get('WXWORK_DB_DIR')
+        self._decrypted_dir = decrypted_dir or os.environ.get('WXWORK_DECRYPTED_DIR')
         self._key_map = key_map
+        self._key_dir = key_directory()
+        self._account_selector = None
+        self._resolved = False
         self._user_map: Optional[dict] = None
+        self._seen_generation = None
+
+    def _resolve(self):
+        if self._resolved:
+            return
+        explicit_output = self._decrypted_dir
+        manifest = read_json(Path(explicit_output).expanduser() / self.MANIFEST) if explicit_output else {}
+        source = self._db_dir or (self._key_map or {}).get('_db_dir')
+        if not source and not self._account_selector and explicit_output:
+            # A portable explicit snapshot remains usable without the original source.
+            source = manifest.get('db_dir')
+            standalone = not manifest and Path(explicit_output).is_dir() and any(Path(explicit_output).glob('*.db'))
+        else:
+            standalone = False
+        if not standalone:
+            source = select_source(source, self._key_dir, self._account_selector)
+        if not source and not explicit_output and not self._account_selector:
+            snapshots = list((default_root('data') / 'decrypted').glob('*/' + self.MANIFEST))
+            records = [(read_json(p), p.parent) for p in snapshots]
+            if records:
+                manifest, output = max(records, key=lambda item: item[0].get('updated_at', 0))
+                source, explicit_output = manifest.get('db_dir'), str(output)
+        self._db_dir = os.path.realpath(source) if source else None
+        self._account = account_id(self._db_dir) if self._db_dir else None
+        output = Path(explicit_output).expanduser() if explicit_output else (
+            default_root('data') / 'decrypted' / (self._account or 'unselected'))
+        self._decrypted_dir = str(output.resolve())
+        self._resolved = True
+        self._check_paths()
+
+    def _check_paths(self):
+        if self._db_dir:
+            try:
+                inside = os.path.commonpath([self._db_dir, self._decrypted_dir]) in (self._db_dir, self._decrypted_dir)
+            except ValueError:
+                inside = False
+            if inside:
+                raise ValueError('Decrypted output directory must be outside the source Data directory and must not contain it')
+        manifest = self._manifest()
+        if manifest and self._account and manifest.get('account') != self._account:
+            raise ValueError('Snapshot belongs to another account; choose a different --decrypted-dir')
+
+    def _manifest(self):
+        return read_json(Path(self._decrypted_dir) / self.MANIFEST)
+
+    def _cache_path(self):
+        return Path(self._key_dir) / f'{self._account}.json'
+
+    def _cache(self):
+        if not self._account:
+            return {}
+        record = read_json(self._cache_path())
+        if record and record.get('db_dir') != self._db_dir:
+            raise RuntimeError('Key cache source does not match selected account')
+        return record
 
     @property
     def db_dir(self) -> Optional[str]:
+        self._resolve()
         return self._db_dir
 
     @property
     def decrypted_dir(self) -> str:
+        self._resolve()
         return self._decrypted_dir
 
     def status(self) -> dict:
-        """Check current status of decrypted data."""
+        """Inspect metadata without scanning memory or refreshing snapshots."""
+        self._resolve()
+        manifest = self._manifest()
+        cache = self._cache()
         result = {
-            "db_dir": self._db_dir,
-            "decrypted_dir": self._decrypted_dir,
-            "decrypted": os.path.isdir(self._decrypted_dir),
-            "databases": {},
+            'account': self._account,
+            'db_dir': self._db_dir,
+            'decrypted_dir': self._decrypted_dir,
+            'key_dir': str(self._key_dir),
+            'key_cached': bool(cache.get('keys')),
+            'key_updated_at': cache.get('updated_at'),
+            'snapshot_updated_at': manifest.get('updated_at'),
+            'snapshot_checked_at': manifest.get('checked_at'),
+            'freshness_seconds': self.FRESHNESS_SECONDS,
+            'decrypted': os.path.isdir(self._decrypted_dir),
+            'accounts': accounts(self._key_dir),
+            'databases': {},
         }
-
-        if os.path.isdir(self._decrypted_dir):
-            for name in os.listdir(self._decrypted_dir):
-                path = os.path.join(self._decrypted_dir, name)
-                if name.endswith(".db") and os.path.isfile(path):
-                    sz = os.path.getsize(path)
-                    try:
-                        with closing(connect_readonly(path)) as conn:
-                            tables = [
-                                r[0]
-                                for r in conn.execute(
-                                    "SELECT name FROM sqlite_master WHERE type='table'"
-                                ).fetchall()
-                            ]
-                    except Exception:
-                        tables = []
-                    result["databases"][name] = {
-                        "size_mb": round(sz / 1024 / 1024, 1),
-                        "tables": tables,
-                    }
-
+        for path in Path(self._decrypted_dir).glob('*.db'):
+            try:
+                with closing(connect_readonly(str(path))) as conn:
+                    tables = [r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")]
+            except Exception:
+                tables = []
+            result['databases'][path.name] = {'size_mb': round(path.stat().st_size / 1024 / 1024, 1), 'tables': tables}
         return result
 
-    def init(
-        self,
-        timeout: int = 120,
-        verbose: bool = False,
-    ) -> dict:
-        """Extract keys from WXWork.exe and decrypt all databases.
-
-        Args:
-            timeout: Max seconds for memory scan per process.
-            verbose: Print progress.
-
-        Returns:
-            Dict with success status, key count, db count, etc.
-        """
-        # Extract keys
-        if self._key_map is None:
-            if verbose:
-                print("[*] Extracting keys from WXWork.exe memory...", file=sys.stderr)
-            self._key_map = extract_key(
-                db_dir=self._db_dir, timeout=timeout, verbose=verbose
-            )
-
-        self._db_dir = self._key_map.get("_db_dir", self._db_dir)
-        if not self._db_dir:
-            raise RuntimeError("No db_dir found in key map")
-
-        source_dir = os.path.realpath(self._db_dir)
-        output_dir = os.path.realpath(self._decrypted_dir)
+    def init(self, timeout: int = 120, verbose: bool = False) -> dict:
+        """Extract and persist verified keys; does not decrypt any database."""
+        self._resolve()
+        if timeout <= 0:
+            raise ValueError('Memory scan timeout must be greater than zero')
+        if not self._db_dir or not os.path.isdir(self._db_dir):
+            raise RuntimeError('Cannot find WeCom data directory. Set --db-dir to the Data directory.')
+        key_map = self._key_map if self._key_map is not None else extract_key(
+            db_dir=self._db_dir, timeout=timeout, verbose=verbose)
         try:
-            output_in_source = os.path.commonpath([source_dir, output_dir]) == source_dir
-        except ValueError:
-            output_in_source = False  # Different Windows drives.
-        if output_in_source:
-            raise ValueError("Decrypted output directory must be outside the source Data directory")
+            keys = sorted({bytes.fromhex(v) for k, v in key_map.items() if not k.startswith('_')})
+        except (ValueError, TypeError):
+            raise RuntimeError('Invalid key map') from None
+        files, _ = _collect_db_files(self._db_dir)
+        verified = [key for key in keys if any(verify_key(key, page) for *_, page in files)]
+        if not verified:
+            raise RuntimeError('No verified keys extracted; existing cache was preserved')
+        record = {'account': self._account, 'db_dir': self._db_dir,
+                  'keys': [key.hex() for key in verified], 'updated_at': time.time(),
+                  'generation': uuid.uuid4().hex}
+        write_json(self._cache_path(), record)
+        # Cache generation invalidates every snapshot for this account without touching them.
+        return {'success': True, 'account': self._account, 'db_dir': self._db_dir,
+                'key_count': len(verified), 'key_file': str(self._cache_path()),
+                'decrypted_dir': self._decrypted_dir}
 
-        # Decrypt databases
-        os.makedirs(self._decrypted_dir, exist_ok=True)
-        success = 0
-        copied = 0
-        failed = 0
+    def _ensure_snapshot(self):
+        self._resolve()
+        manifest = self._manifest()
+        if not self._db_dir or not os.path.isdir(self._db_dir):
+            if any(Path(self._decrypted_dir).glob('*.db')):
+                return  # Explicit legacy/imported snapshots and offline snapshots.
+            raise RuntimeError('No source or snapshot found; run init with --db-dir first')
+        cache = self._cache()
+        generation = manifest.get('generation')
+        if generation != self._seen_generation:
+            self._user_map = None
+            self._seen_generation = generation
+        age = time.time() - manifest.get('checked_at', 0)
+        if manifest and 0 <= age < self.FRESHNESS_SECONDS and manifest.get('key_generation') == cache.get('generation'):
+            return
+        self.refresh()
 
-        for root, dirs, files in os.walk(self._db_dir):
-            dirs[:] = [d for d in dirs if d not in ("-journal",)]
-            for name in files:
-                if not name.endswith(".db") or name.endswith("-wal") or name.endswith("-shm"):
-                    continue
-                path = os.path.join(root, name)
-                rel = os.path.relpath(path, self._db_dir)
-                out_path = os.path.join(self._decrypted_dir, rel)
-
-                with open(path, "rb") as f:
-                    page1 = f.read(4096)
-
-                if is_plain_sqlite(page1):
-                    os.makedirs(os.path.dirname(out_path), exist_ok=True)
-                    shutil.copy2(path, out_path)
-                    copied += 1
-                    continue
-
-                if not is_wxsqlite3_aes128_page1(page1):
-                    failed += 1
-                    continue
-
-                # Find key for this DB
-                salt_hex = page1[:16].hex()
-                key_hex = self._key_map.get(salt_hex)
-                if not key_hex:
-                    # Try all keys
-                    for k, v in self._key_map.items():
-                        if k.startswith("_"):
+    def refresh(self) -> dict:
+        """Immediately check source changes and refresh using cached keys only."""
+        self._resolve()
+        if not self._db_dir or not os.path.isdir(self._db_dir):
+            raise RuntimeError('Source directory is unavailable; cannot refresh')
+        self._check_paths()
+        output = Path(self._decrypted_dir)
+        private_directory(output)
+        with snapshot_lock(output):
+            self._check_paths()
+            manifest = self._manifest()
+            cache = self._cache()
+            try:
+                values = cache.get('keys', []) if self._key_map is None else [v for k, v in self._key_map.items() if not k.startswith('_')]
+                keys = [bytes.fromhex(v) for v in values]
+            except (ValueError, TypeError):
+                raise RuntimeError('Invalid key cache; run init') from None
+            before = fingerprints(self._db_dir)
+            if not before:
+                raise RuntimeError('No source databases found; snapshot was preserved')
+            changed = [name for name, stats in before.items()
+                       if manifest.get('files', {}).get(name) != stats or not (output / name).is_file()]
+            # Revalidate keys after explicit init, even when source bytes did not change.
+            if manifest.get('key_generation') != cache.get('generation'):
+                changed = list(before)
+            removed = set(manifest.get('files', {})) - set(before)
+            counts = {'decrypted': 0, 'copied': 0, 'failed': 0}
+            with tempfile.TemporaryDirectory(prefix='.refresh-', dir=output) as temporary:
+                staging = Path(temporary)
+                for name in changed:
+                    kind = build_database(Path(self._db_dir) / name, staging / name, keys)
+                    counts[kind] += 1
+                    with closing(connect_readonly(str(staging / name))) as conn:
+                        try:
+                            check = conn.execute('PRAGMA quick_check').fetchall()
+                        except sqlite3.OperationalError as error:
+                            if name != 'crm.db' or str(error) != 'no such tokenizer: fts5word':
+                                raise
+                            logging.getLogger(__name__).warning(
+                                'Skipping integrity check for crm.db: no such tokenizer: fts5word; '
+                                'this database has not been fully validated'
+                            )
                             continue
-                        if verify_key(bytes.fromhex(v), page1):
-                            key_hex = v
-                            break
-
-                if not key_hex:
-                    failed += 1
-                    continue
-
-                try:
-                    decrypt_database(path, out_path, bytes.fromhex(key_hex))
-                    success += 1
-                except Exception:
-                    failed += 1
-
-        return {
-            "success": success > 0,
-            "decrypted": success,
-            "copied": copied,
-            "failed": failed,
-            "decrypted_dir": self._decrypted_dir,
-        }
+                        if check != [('ok',)]:
+                            raise RuntimeError(f'Invalid decrypted database: {name}; old snapshot was preserved')
+                if before != fingerprints(self._db_dir):
+                    raise RuntimeError('Source changed during refresh; retry refresh (old snapshot preserved)')
+                now = time.time()
+                generation = uuid.uuid4().hex if changed or removed else manifest.get('generation', uuid.uuid4().hex)
+                with publish_files(staging, output, changed, removed):
+                    write_json(output / self.MANIFEST, {
+                        'account': self._account, 'db_dir': self._db_dir, 'files': before,
+                        'checked_at': now, 'updated_at': now if changed or removed else manifest.get('updated_at', now),
+                        'key_generation': cache.get('generation'), 'generation': generation,
+                    })
+            self._user_map = None
+            self._seen_generation = generation
+            return {'success': True, 'account': self._account, 'db_dir': self._db_dir,
+                    'decrypted_dir': self._decrypted_dir, 'updated': len(changed), 'removed': len(removed), **counts}
 
     def _get_db_path(self, name: str) -> Optional[str]:
-        """Get path to a decrypted database file."""
-        if not os.path.isdir(self._decrypted_dir):
-            return None
+        self._ensure_snapshot()
         path = os.path.join(self._decrypted_dir, name)
         return path if os.path.isfile(path) else None
 

@@ -286,7 +286,7 @@ def main():
     import argparse
     parser = argparse.ArgumentParser(description="Deprecated WeCom web viewer; only the CLI is maintained")
     parser.add_argument("--db-dir", required=True, help="WeCom data directory")
-    parser.add_argument("--decrypted-dir", default="wxwork_decrypted", help="Decrypted DB directory")
+    parser.add_argument("--decrypted-dir", default=None, help="Decrypted DB directory")
     parser.add_argument("--port", type=int, default=8765, help="Web server port")
     parser.add_argument("--host", default="127.0.0.1", help="Bind address")
     args = parser.parse_args()
@@ -295,7 +295,7 @@ def main():
 
     global reader
     reader = WeComReader(db_dir=args.db_dir, decrypted_dir=args.decrypted_dir)
-    print(f"[*] Decrypted data: {args.decrypted_dir}")
+    print(f"[*] Decrypted data: {reader.decrypted_dir}")
     print(f"[*] Starting web UI on http://{args.host}:{args.port}")
     app.run(host=args.host, port=args.port, debug=False)
 
